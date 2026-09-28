@@ -4,6 +4,8 @@ Part of the [DOMLAB](https://github.com/Justdomi) homelab. This project implemen
 firewall-based network segmentation on OPNsense, isolating the lab's Kali/Metasploitable2 attack
 range from the Active Directory / Windows Server Failover Cluster (WSFC) identity segment.
 
+> **Update (Sep 2026):** The identity segment (10.10.10.0/24) has since moved off the interface named `Lab10101010` in this write-up. It is now served by a dedicated tagged interface, `DCSEGMENT` (VLAN 15), and the second firewall that originally fronted it was retired. The block rules below match on the destination subnet, so they kept working unchanged, and they were re-tested after the change. See [dc01-segmentation](dc01-segmentation/README.md) for the full story.
+
 ## Objective
 
 DOMLAB runs several isolated network segments behind an OPNsense firewall/router:
