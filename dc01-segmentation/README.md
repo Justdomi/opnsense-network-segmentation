@@ -64,10 +64,83 @@ Full end-to-end SSH session, authenticated as `domlab\administrator`, proving bo
 
 - VM 140 is now the sole firewall for DC01/WSFC, alongside its existing Kali and Metasploitable2 segments — one firewall, three isolated interfaces, consistent design across the board.
 - VM 141 was decommissioned — its job is now done by proper VLAN trunking, the capability that was missing when it was first built.
-- iSCSI traffic (previously sharing VLAN 10 with switch management traffic) was identified for the same treatment — a dedicated VLAN, separate from both management and domain traffic, following the same reasoning: keep storage I/O and broadcast domains isolated from unrelated traffic.
+- iSCSI storage traffic was checked for the same treatment and found to need none: the storage NICs sit on an internal-only Proxmox bridge (`vmbr2`) with no physical uplink, so that traffic never reaches the switch fabric at all. See the follow-up below for what the check turned up instead.
 
 ## Lessons Worth Keeping
 
 - **A stopgap isn't a mistake — but it needs a defined retirement condition.** VM 141 was the right call when it was built. The mistake would have been leaving it in place indefinitely instead of recognizing, once VLAN trunking became available, that the original constraint no longer existed.
 - **OPNsense's gateway-monitoring (`dpinger`) will silently disable a route** if it can't get ICMP replies from the gateway it's pointed at — even though the route still shows as present and correctly formed in the routing table (`netstat -rn`). A route that looks right but never gets used is a strong signal to check gateway status before anything else.
 - **An IP-conflict error at interface creation is useful, not just an obstacle** — in this case it caught a real leftover artifact from the abandoned design that would otherwise have sat unnoticed.
+
+## Follow-up: What Else Depended on DC01
+
+Moving DC01 to VLAN 15 changed the network for every machine that talks to it, not just DC01 itself. Once the SSH test passed, the next job was to check each dependent VM from the inside. The check used one command, run from each machine's own console:
+
+```powershell
+Test-NetConnection 10.10.10.10 -Port 389
+```
+
+Port 389 is LDAP, the protocol a domain member uses to reach the domain controller's directory. A `False` result with `DestinationHostUnreachable` is a Layer 2 signature: the machine believes DC01 is on its own subnet and sends an ARP request, but nothing on that VLAN answers. A firewall block would normally time out instead.
+
+Three VMs, three different outcomes:
+
+| VM | Result | Cause |
+|---|---|---|
+| WSFC nodes (110, 111) | Reachable | Already tagged VLAN 15 |
+| ISCSI01 (106) | Unreachable | Domain-side NIC still on the old VLAN (tag 10) |
+| IIS01 (200, different Proxmox node) | Unreachable | Tag was correct; the physical switch port didn't carry VLAN 15 |
+
+### ISCSI01: wrong tag on one of two NICs
+
+ISCSI01 has two NICs. `net0` carries iSCSI storage traffic on an internal-only bridge, and `net1` carries domain traffic on `vmbr0`. Only `net1` was affected, and it was still tagged VLAN 10:
+
+![ISCSI01 hardware before the fix](screenshots/10-iscsi01-hardware-before-fix.png)
+
+Changing `net1` from tag 10 to tag 15 fixed it. The same command, before and after, from the same source address:
+
+![ISCSI01 reaches DC01 after the retag](screenshots/11-iscsi01-domain-path-restored.png)
+
+The storage NIC was left alone, so the cluster's disk connection was never touched.
+
+### IIS01: right tag, wrong port
+
+IIS01 lives on a different Proxmox node than DC01, so its traffic has to cross the physical switch. Its NIC was already tagged correctly:
+
+![IIS01 hardware showing tag 15](screenshots/12-iis01-hardware-tag-correct.png)
+
+It still failed the test, because VLAN 15 had only been added to the two TRENDnet ports for the nodes in the original build. Adding the third node's port (port 16, tagged, no untagged members) fixed it:
+
+![IIS01 reaches DC01 after the port was added](screenshots/13-iis01-domain-path-restored.png)
+
+IIS01 was the only VM off the original node, so it was the only one that exercised the cross-node path. The same-node VMs could not have caught this.
+
+### Cluster health
+
+ISCSI01 had lost its domain path for a while, so the cluster and its storage were checked afterward. Both nodes came back `Up` and the Cluster Shared Volume `Online` with no repair needed:
+
+![Cluster nodes Up and CSV Online](screenshots/14-cluster-health-check.png)
+
+### Cleanup
+
+The stale interface left over from the original incident was removed from OPNsense (the device shows up unassigned in the dropdown only because nothing owns it now):
+
+![Stale interface removed](screenshots/15-stale-interface-removed.png)
+
+The temporary firewall, VM 141, was deleted once every dependent machine was verified working without it:
+
+![VM 141 no longer in the inventory](screenshots/17-vm141-decommissioned.png)
+
+### Re-testing the earlier segmentation
+
+The block rules from the original segmentation work match on the destination subnet (10.10.10.0/24), not on an interface name. Because the new interface took over that subnet, they should keep protecting DC01 without edits, but that was worth proving rather than assuming. From Kali:
+
+![Kali cannot reach DC01 but can reach the internet](screenshots/16-kali-segmentation-retest.png)
+
+DC01 is still blocked (100% loss) while external traffic is unaffected (0% loss). The reply from the Metasploitable2 host shows a TTL one below the sender's starting value, confirming that traffic crosses the firewall instead of sharing a segment.
+
+### Lessons from the follow-up
+
+- **After moving a segment, test every machine that talks to it, from the inside.** The VM tag and the physical port are two separate places to get it wrong, and each of the three VMs failed or passed for a different reason.
+- **One test, three different answers.** `Test-NetConnection` on a specific port separates "the network is broken" from "the service is broken" in a way a plain ping cannot.
+- **Assumptions written into documentation need the same checking as configuration.** An earlier draft of this write-up said iSCSI shared a VLAN with management traffic. The hardware tab showed it didn't, and the section above was corrected.
+- **Rules written against a subnet outlive interface changes.** Rules tied to an interface name would have needed rewriting after the redesign; these didn't.
